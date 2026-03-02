@@ -1,7 +1,6 @@
-import io
 import math
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -189,6 +188,13 @@ def summarize_emojis(emojis: List[str], lexicon_indexed: pd.DataFrame, agg_metho
     }
 
 
+def slugify(value: str) -> str:
+    value = str(value).strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or "unknown"
+
+
 def make_family_weights(emojis: List[str], lexicon_indexed: pd.DataFrame, families: List[str]) -> Dict[str, float]:
     hits = [e for e in emojis if e in lexicon_indexed.index]
     out = {f"family_weight_{slugify(f)}": 0.0 for f in families}
@@ -201,13 +207,6 @@ def make_family_weights(emojis: List[str], lexicon_indexed: pd.DataFrame, famili
     for family in families:
         out[f"family_weight_{slugify(family)}"] = round(float(counts.get(family, 0.0)), 4)
     return out
-
-
-def slugify(value: str) -> str:
-    value = str(value).strip().lower()
-    value = re.sub(r"[^a-z0-9]+", "_", value)
-    value = re.sub(r"_+", "_", value).strip("_")
-    return value or "unknown"
 
 
 def transform_dataframe(
@@ -254,6 +253,79 @@ def read_uploaded_table(uploaded_file) -> pd.DataFrame:
     if suffix in {"xlsx", "xls"}:
         return pd.read_excel(uploaded_file)
     raise ValueError("Unsupported file type. Please upload a CSV or Excel file.")
+
+
+def make_copy_tsv(df: pd.DataFrame) -> str:
+    return df.to_csv(index=False, sep="\t")
+
+
+def make_copy_csv(df: pd.DataFrame) -> str:
+    return df.to_csv(index=False)
+
+
+def parse_pasted_emoji_input(raw_text: str, pattern, unique_only: bool) -> List[str]:
+    if not raw_text or pattern is None:
+        return []
+    extracted = pattern.findall(str(raw_text))
+    if unique_only:
+        deduped = []
+        seen = set()
+        for emoji in extracted:
+            if emoji not in seen:
+                seen.add(emoji)
+                deduped.append(emoji)
+        return deduped
+    return extracted
+
+
+def build_survey_codebook(
+    raw_text: str,
+    lexicon: pd.DataFrame,
+    unique_only: bool = True,
+    include_order: bool = True,
+    prefix: str = "emoji",
+) -> pd.DataFrame:
+    pattern = build_emoji_pattern(lexicon["emoji"].tolist())
+    parsed = parse_pasted_emoji_input(raw_text, pattern, unique_only=unique_only)
+    if not parsed:
+        return pd.DataFrame(
+            columns=[
+                "emoji_order",
+                "emoji",
+                "variable_name",
+                "label",
+                "valence",
+                "arousal",
+                "dominance",
+                "intensity",
+                "primary_family",
+                "secondary_family",
+                "notes",
+            ]
+        )
+
+    lexicon_indexed = lexicon.set_index("emoji", drop=False)
+    rows = []
+    for i, emoji in enumerate(parsed, start=1):
+        if emoji not in lexicon_indexed.index:
+            continue
+        row = lexicon_indexed.loc[emoji]
+        rows.append(
+            {
+                "emoji_order": i if include_order else "",
+                "emoji": emoji,
+                "variable_name": f"{prefix}_{i}" if include_order else prefix,
+                "label": row["label"],
+                "valence": round(float(row["valence"]), 4),
+                "arousal": round(float(row["arousal"]), 4),
+                "dominance": round(float(row["dominance"]), 4),
+                "intensity": round(float(row["intensity"]), 4),
+                "primary_family": row["primary_family"],
+                "secondary_family": row["secondary_family"],
+                "notes": row["notes"],
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 st.title("😀 Emoji Emotion Encoder")
@@ -347,114 +419,208 @@ if lexicon.empty:
 
 st.divider()
 
-lookup_col, details_col = st.columns([1, 1])
-with lookup_col:
-    st.subheader("Quick lookup / string conversion")
-    quick_text = st.text_area(
-        "Enter one emoji or a text string containing emojis",
-        value="I felt 😟 before the exam but later became 😌 and 😀",
-        height=120,
+survey_tab, quick_tab, batch_tab = st.tabs([
+    "Survey emoji codebook",
+    "Quick lookup / string conversion",
+    "Batch dataset conversion",
+])
+
+with survey_tab:
+    st.subheader("Paste survey emojis and generate a copy-ready coding table")
+    st.write(
+        "Paste the exact emojis used in your instrument. The app will extract them in order, match them to the active lexicon, and generate a clean table you can copy into Excel, SPSS, R, or your data array."
     )
-    if st.button("Convert text", use_container_width=True):
-        pattern = build_emoji_pattern(lexicon["emoji"].tolist())
-        extracted = extract_mapped_emojis(quick_text, pattern)
-        summary = summarize_emojis(extracted, lexicon.set_index("emoji", drop=False), agg_method)
-        family_weights = make_family_weights(
-            extracted,
-            lexicon.set_index("emoji", drop=False),
-            sorted([f for f in lexicon["primary_family"].dropna().astype(str).unique().tolist() if f.strip()]),
+
+    survey_controls_col1, survey_controls_col2, survey_controls_col3 = st.columns([1, 1, 1])
+    with survey_controls_col1:
+        unique_only = st.checkbox(
+            "Keep only unique emojis",
+            value=True,
+            help="Useful when you want one codebook row per distinct survey emoji rather than repeating duplicates.",
+            key="survey_unique_only",
+        )
+    with survey_controls_col2:
+        include_order = st.checkbox(
+            "Include order column",
+            value=True,
+            help="Keeps the order in which emojis appear in your pasted survey text.",
+            key="survey_include_order",
+        )
+    with survey_controls_col3:
+        prefix = st.text_input(
+            "Variable prefix",
+            value="emoji",
+            help="Used to generate helper variable names such as emoji_1, emoji_2, etc.",
+            key="survey_prefix",
+        ).strip() or "emoji"
+
+    survey_text = st.text_area(
+        "Paste emojis here",
+        value="😀 😟 😌 ❤️ 😡 😭",
+        height=140,
+        help="You can paste plain emoji strings, full survey items containing emojis, or text copied from a form. The app will pull out the emojis that exist in the lexicon.",
+        key="survey_text",
+    )
+
+    survey_codebook = build_survey_codebook(
+        raw_text=survey_text,
+        lexicon=lexicon,
+        unique_only=unique_only,
+        include_order=include_order,
+        prefix=prefix,
+    )
+
+    if survey_codebook.empty:
+        st.warning("No emojis from your pasted text matched the active lexicon. Add them to the lexicon above, then paste again.")
+    else:
+        st.write("Generated coding table")
+        st.dataframe(survey_codebook, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "Download coding table as CSV",
+            data=dataframe_to_csv_download(survey_codebook),
+            file_name="survey_emoji_codebook.csv",
+            mime="text/csv",
         )
 
-        st.session_state.quick_extracted = extracted
-        st.session_state.quick_summary = summary
-        st.session_state.quick_family_weights = family_weights
+        copy_col1, copy_col2 = st.columns(2)
+        with copy_col1:
+            st.write("Copy-paste table (tab-separated)")
+            st.text_area(
+                "TSV output",
+                value=make_copy_tsv(survey_codebook),
+                height=220,
+                help="Copy this block and paste directly into Excel, Google Sheets, or many stats packages.",
+                key="survey_tsv_output",
+            )
+        with copy_col2:
+            st.write("Copy-paste table (comma-separated)")
+            st.text_area(
+                "CSV output",
+                value=make_copy_csv(survey_codebook),
+                height=220,
+                help="Useful if you want a plain text CSV block for scripts or manual import.",
+                key="survey_csv_output",
+            )
 
-with details_col:
-    st.subheader("Converted outputs")
-    if "quick_summary" in st.session_state:
-        st.write("Detected emojis:", st.session_state.quick_summary["emoji_detected"] or "None")
-        metric_df = pd.DataFrame([
-            {
-                "emoji_count": st.session_state.quick_summary["emoji_count"],
-                "valence": st.session_state.quick_summary["valence"],
-                "arousal": st.session_state.quick_summary["arousal"],
-                "dominance": st.session_state.quick_summary["dominance"],
-                "intensity": st.session_state.quick_summary["intensity"],
-                "primary_family": st.session_state.quick_summary["primary_family"],
-                "secondary_family": st.session_state.quick_summary["secondary_family"],
-            }
-        ])
-        st.dataframe(metric_df, use_container_width=True, hide_index=True)
+        st.caption(
+            f"Matched {len(survey_codebook)} emoji rows from the pasted survey content."
+        )
 
-        if st.session_state.quick_extracted:
-            hit_df = lexicon[lexicon["emoji"].isin(st.session_state.quick_extracted)].copy()
-            hit_df = hit_df[["emoji", "label", "valence", "arousal", "dominance", "intensity", "primary_family", "secondary_family"]]
-            st.write("Matched emoji rows")
-            st.dataframe(hit_df, use_container_width=True, hide_index=True)
+with quick_tab:
+    lookup_col, details_col = st.columns([1, 1])
+    with lookup_col:
+        st.subheader("Convert one emoji string")
+        quick_text = st.text_area(
+            "Enter one emoji or a text string containing emojis",
+            value="I felt 😟 before the exam but later became 😌 and 😀",
+            height=120,
+            key="quick_text",
+        )
+        if st.button("Convert text", use_container_width=True):
+            pattern = build_emoji_pattern(lexicon["emoji"].tolist())
+            extracted = extract_mapped_emojis(quick_text, pattern)
+            summary = summarize_emojis(extracted, lexicon.set_index("emoji", drop=False), agg_method)
+            family_weights = make_family_weights(
+                extracted,
+                lexicon.set_index("emoji", drop=False),
+                sorted([f for f in lexicon["primary_family"].dropna().astype(str).unique().tolist() if f.strip()]),
+            )
 
-        if include_family_weights:
-            family_weight_df = pd.DataFrame([st.session_state.quick_family_weights])
-            st.write("Family weights")
-            st.dataframe(family_weight_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("Run the quick conversion to preview how emoji strings will be encoded.")
+            st.session_state.quick_extracted = extracted
+            st.session_state.quick_summary = summary
+            st.session_state.quick_family_weights = family_weights
 
-st.divider()
-st.subheader("Batch conversion for analysis datasets")
-uploaded = st.file_uploader(
-    "Upload a CSV or Excel dataset",
-    type=["csv", "xlsx", "xls"],
-    help="Upload a dataset containing a column with emojis or free text that includes emojis.",
-    key="data_upload",
-)
+    with details_col:
+        st.subheader("Converted outputs")
+        if "quick_summary" in st.session_state:
+            st.write("Detected emojis:", st.session_state.quick_summary["emoji_detected"] or "None")
+            metric_df = pd.DataFrame([
+                {
+                    "emoji_count": st.session_state.quick_summary["emoji_count"],
+                    "valence": st.session_state.quick_summary["valence"],
+                    "arousal": st.session_state.quick_summary["arousal"],
+                    "dominance": st.session_state.quick_summary["dominance"],
+                    "intensity": st.session_state.quick_summary["intensity"],
+                    "primary_family": st.session_state.quick_summary["primary_family"],
+                    "secondary_family": st.session_state.quick_summary["secondary_family"],
+                }
+            ])
+            st.dataframe(metric_df, use_container_width=True, hide_index=True)
 
-if uploaded is not None:
-    try:
-        source_df = read_uploaded_table(uploaded)
-        if source_df.empty:
-            st.warning("The uploaded dataset is empty.")
+            if st.session_state.quick_extracted:
+                hit_df = lexicon[lexicon["emoji"].isin(st.session_state.quick_extracted)].copy()
+                hit_df = hit_df[["emoji", "label", "valence", "arousal", "dominance", "intensity", "primary_family", "secondary_family"]]
+                st.write("Matched emoji rows")
+                st.dataframe(hit_df, use_container_width=True, hide_index=True)
+
+            if include_family_weights:
+                family_weight_df = pd.DataFrame([st.session_state.quick_family_weights])
+                st.write("Family weights")
+                st.dataframe(family_weight_df, use_container_width=True, hide_index=True)
         else:
-            st.write("Preview of uploaded data")
-            st.dataframe(source_df.head(10), use_container_width=True)
+            st.info("Run the quick conversion to preview how emoji strings will be encoded.")
 
-            emoji_candidate_cols = source_df.columns.tolist()
-            selected_col = st.selectbox(
-                "Which column should be converted?",
-                options=emoji_candidate_cols,
-                help="The app will search that column for any emojis included in the lexicon.",
-            )
+with batch_tab:
+    st.subheader("Batch conversion for analysis datasets")
+    uploaded = st.file_uploader(
+        "Upload a CSV or Excel dataset",
+        type=["csv", "xlsx", "xls"],
+        help="Upload a dataset containing a column with emojis or free text that includes emojis.",
+        key="data_upload",
+    )
 
-            transformed_df = transform_dataframe(
-                df=source_df,
-                source_col=selected_col,
-                lexicon=lexicon,
-                agg_method=agg_method,
-                include_family_weights=include_family_weights,
-            )
+    if uploaded is not None:
+        try:
+            source_df = read_uploaded_table(uploaded)
+            if source_df.empty:
+                st.warning("The uploaded dataset is empty.")
+            else:
+                st.write("Preview of uploaded data")
+                st.dataframe(source_df.head(10), use_container_width=True)
 
-            st.write("Transformed data preview")
-            st.dataframe(transformed_df.head(25), use_container_width=True)
+                emoji_candidate_cols = source_df.columns.tolist()
+                selected_col = st.selectbox(
+                    "Which column should be converted?",
+                    options=emoji_candidate_cols,
+                    help="The app will search that column for any emojis included in the lexicon.",
+                    key="selected_data_column",
+                )
 
-            nonmissing = transformed_df["emoji_count"].fillna(0).gt(0).sum()
-            st.caption(f"Rows with at least one matched emoji: {nonmissing} of {len(transformed_df)}")
+                transformed_df = transform_dataframe(
+                    df=source_df,
+                    source_col=selected_col,
+                    lexicon=lexicon,
+                    agg_method=agg_method,
+                    include_family_weights=include_family_weights,
+                )
 
-            download_bytes = dataframe_to_csv_download(transformed_df)
-            st.download_button(
-                "Download transformed CSV",
-                data=download_bytes,
-                file_name="emoji_encoded_output.csv",
-                mime="text/csv",
-            )
-    except Exception as e:
-        st.error(f"Could not process the uploaded dataset: {e}")
-else:
-    st.info("Upload a CSV or Excel dataset to create row-level emotion variables for downstream statistical analysis.")
+                st.write("Transformed data preview")
+                st.dataframe(transformed_df.head(25), use_container_width=True)
+
+                nonmissing = transformed_df["emoji_count"].fillna(0).gt(0).sum()
+                st.caption(f"Rows with at least one matched emoji: {nonmissing} of {len(transformed_df)}")
+
+                download_bytes = dataframe_to_csv_download(transformed_df)
+                st.download_button(
+                    "Download transformed CSV",
+                    data=download_bytes,
+                    file_name="emoji_encoded_output.csv",
+                    mime="text/csv",
+                )
+        except Exception as e:
+            st.error(f"Could not process the uploaded dataset: {e}")
+    else:
+        st.info("Upload a CSV or Excel dataset to create row-level emotion variables for downstream statistical analysis.")
 
 st.divider()
 st.subheader("How to use these outputs in analysis")
 st.write(
     "The most directly usable continuous predictors are emoji_valence, emoji_arousal, emoji_dominance, and emoji_intensity. "
     "If you enable family weights, those columns can be used as additional continuous indicators or descriptive features."
+)
+st.write(
+    "The new survey emoji codebook tab is designed for instrument development and data preparation: paste the emoji set used in your survey, then copy the TSV output directly into your coding sheet or analysis array."
 )
 st.write(
     "Typical use cases include linear regression, mixed-effects models, scale development, convergent validity checks, and sensitivity analyses comparing dimensional coding against simpler categorical encodings."
